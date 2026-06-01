@@ -1,0 +1,20 @@
+﻿secrets.toml
+.streamlit/
+*.key
+.bpb_propgen_key
+.bpb_propgen_pw
+sk-ant-*.txt
+*api03*
+BPB_PropGen_v1.py
+BPB_PropGen_v2.py
+BPB_PropGen_v4.py
+BPB_PropGen_v5.py
+BPB_PropGen_v6.py
+BPB_PropGen_v7.py
+BPB_PropGen_v8.py
+BPB_PropGen_v9.py
+BPB_PropGen_v10.py
+BPB_PropGen_v11.py
+BPB_PropGen_v12.py
+BPB_PropGen_v13.py
+Troubleshooting script/
