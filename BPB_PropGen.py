@@ -42,7 +42,7 @@ from pptx.oxml.ns import qn
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v18"
+APP_VERSION = "v19"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -841,6 +841,23 @@ def llm_extract(client, model, transcript):
     return json.loads(_strip_fences(raw))
 
 
+def merge_phases_keep_pricing(milestones, phases):
+    """Merge LLM-suggested phases into milestones by row position, preserving any
+    price/terms already entered. Pricing is never LLM-generated."""
+    old = milestones or []
+    merged = []
+    for i, item in enumerate(list(phases)[:6]):
+        prev = old[i] if i < len(old) else {}
+        merged.append({
+            "short_label": str(item.get("short_label", "") or ""),
+            "duration": normalize_weeks_cell(item.get("duration", "")),
+            "name": str(item.get("name", "") or ""),
+            "price": prev.get("price", ""),
+            "terms": prev.get("terms", ""),
+        })
+    return merged
+
+
 def llm_draft(client, model, params):
     keys = ["customer_short", "pi_contact", "target", "target_type",
             "existing_aptamer", "existing_aptamer_desc", "biological_matrix",
@@ -849,6 +866,59 @@ def llm_draft(client, model, params):
     payload = {k: params.get(k) for k in keys}
     user = "PARAMETERS:\n\n" + json.dumps(payload, indent=2)
     raw = call_llm(client, model, DRAFT_SYSTEM, user, max_tokens=1600)
+    return json.loads(_strip_fences(raw))
+
+
+REVISE_SYSTEM = """You revise an existing Base Pair Biotechnologies commercial
+proposal in light of customer feedback. Base Pair discovers custom DNA/RNA aptamers.
+Voice: professional, confident, client-facing, concrete. Present/future tense.
+
+You are given THREE things: (1) the original discovery-call transcript, (2) the
+CURRENT proposal (its parameters and drafted slide text), and (3) new FEEDBACK
+(an email thread, notes, or a follow-up call). Produce a REVISED proposal that
+honors the feedback, preserves anything the feedback does not change, and reflects
+any agreed change in strategy, sequencing, or scope.
+
+Return ONLY a JSON object (no markdown fences) with these keys (include a key only
+if it should change; omitted keys keep their current value):
+  subtitle           revised title-slide subtitle in the form "Confidential Proposal
+                     to <customer> for a <descriptor> Aptamer <Diagnostic|Development
+                     Program>" if the project framing changed; else omit.
+  phase_label        revised parenthetical scope note for the title slide if scope/
+                     phasing changed (e.g. "(Phase I - denatured-form assay)"); else omit.
+  challenge_text     ONE paragraph (no "Challenge:" label), 3-5 sentences, updated for
+                     the feedback.
+  strategy_text      ONE paragraph (no "Strategy:" label), 4-6 sentences, updated for
+                     the feedback (e.g. revised order of work, new sub-targets,
+                     deferred phases, changed matrix/denaturation).
+  workflow_bullets   a JSON array of 6-8 short imperative bullets reflecting the
+                     revised plan. End the synthesis/deliverable bullet with "*".
+  phases             a JSON array of 4-6 objects {"short_label","duration","name"}
+                     for the revised payment/timeline phases. You MAY restructure
+                     these (reorder, split, add, or remove phases) to match the
+                     feedback -- e.g. sequencing a denatured-form phase before a
+                     harder neat-serum phase. duration is WEEKS as a bare number or
+                     range only (e.g. "1" or "2-3"). DO NOT include price or terms.
+ABSOLUTE RULE: never output prices, payment terms, or dollar amounts -- pricing is
+set by the user only. Keep affinity methods/numbers consistent unless the feedback
+changes them."""
+
+
+def llm_revise(client, model, params, transcript, feedback):
+    keys = ["customer_short", "pi_contact", "target", "target_type",
+            "existing_aptamer", "existing_aptamer_desc", "biological_matrix",
+            "off_targets", "assay_format_goal", "kd_method", "phases_included",
+            "background_problem", "subtitle", "phase_label", "challenge_text",
+            "strategy_text", "workflow_bullets"]
+    current = {k: params.get(k) for k in keys}
+    current["phases"] = [{"short_label": m.get("short_label", ""),
+                          "duration": m.get("duration", ""),
+                          "name": m.get("name", "")}
+                         for m in params.get("milestones", [])]
+    user = ("ORIGINAL TRANSCRIPT:\n\n" + (transcript or "")[:16000]
+            + "\n\n----\nCURRENT PROPOSAL:\n\n" + json.dumps(current, indent=2)
+            + "\n\n----\nFEEDBACK:\n\n" + (feedback or "")[:8000])
+    raw = call_llm(client, model, REVISE_SYSTEM, user, max_tokens=1800)
     return json.loads(_strip_fences(raw))
 
 
@@ -993,66 +1063,94 @@ def run_app():
                 st.rerun()
 
     # ====================================================================== #
-    # STEP 1 — Transcript ingestion
+    # STEP 1 — Transcript / revision input
     # ====================================================================== #
     st.subheader("1) Discovery-call transcript")
+    mode = st.radio(
+        "Mode", ["New proposal", "Revise existing"], horizontal=True,
+        help="New: draft a fresh proposal from a transcript. Revise: apply "
+             "customer feedback (e.g. an email thread) to the proposal currently "
+             "loaded below, keeping your prices.")
     up = st.file_uploader("Upload Otter transcript (.txt)", type=["txt"])
     transcript = ""
     if up is not None:
         transcript = up.read().decode("utf-8", errors="ignore")
     transcript = st.text_area("…or paste transcript here", value=transcript, height=160)
 
+    feedback = ""
+    if mode == "Revise existing":
+        feedback = st.text_area(
+            "Follow-up / feedback (paste the email thread, notes, or a follow-up call)",
+            height=160)
+
     c1, c2 = st.columns([1, 3])
     with c1:
-        do_generate = st.button("Draft Challenge & Strategy", type="primary",
-                                key="btn_draft")
+        if mode == "New proposal":
+            do_action = st.button("Draft Challenge & Strategy", type="primary",
+                                  key="btn_draft")
+        else:
+            do_action = st.button("Apply feedback & re-draft", type="primary",
+                                  key="btn_draft")
     with c2:
-        st.caption("Reads the transcript, then drafts the title, Challenge, Strategy, "
-                   "Workflow & phases. Pricing is never set automatically \u2014 you enter "
-                   "that in section 3. Review everything below before Build.")
-    if do_generate:
+        if mode == "New proposal":
+            st.caption("Reads the transcript, then drafts the title, Challenge, "
+                       "Strategy, Workflow & phases. Pricing is never set "
+                       "automatically \u2014 you enter that in section 3.")
+        else:
+            st.caption("Applies the feedback to the proposal currently loaded below "
+                       "(it can reorder/split phases). Your prices are preserved. "
+                       "Review everything before Build.")
+
+    if do_action:
         if not client:
             st.error("Provide an Anthropic API key first.")
-        elif not transcript.strip():
+        elif mode == "New proposal" and not transcript.strip():
             st.error("Add a transcript first.")
+        elif mode == "Revise existing" and not feedback.strip():
+            st.error("Paste the feedback to apply first.")
         else:
             try:
-                with st.spinner("Reading the call…"):
-                    extracted = llm_extract(client, model, transcript)
-                    for k, v in extracted.items():
-                        if v not in (None, ""):
-                            P[k] = v
-                    tt = P.get("target_type", "Protein")
-                    P["kd_method"] = KD_METHOD_BY_TYPE.get(tt, KD_METHOD_BY_TYPE["Other"])
-                    P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
-                with st.spinner("Drafting in Base Pair voice…"):
-                    drafted = llm_draft(client, model, P)
-                    P["challenge_text"] = drafted.get("challenge_text", P["challenge_text"])
-                    P["strategy_text"] = drafted.get("strategy_text", P["strategy_text"])
-                    wb = drafted.get("workflow_bullets")
-                    if isinstance(wb, list) and wb:
-                        P["workflow_bullets"] = wb
-                    # Merge suggested phases into milestones: fill banner label,
-                    # duration and milestone name; KEEP any prices/terms already set
-                    # (pricing is never LLM-generated).
-                    ph = drafted.get("phases")
-                    if isinstance(ph, list) and ph:
-                        old = P.get("milestones", [])
-                        merged = []
-                        for i, item in enumerate(ph[:6]):
-                            prev = old[i] if i < len(old) else {}
-                            merged.append({
-                                "short_label": str(item.get("short_label", "") or ""),
-                                "duration": str(item.get("duration", "") or ""),
-                                "name": str(item.get("name", "") or ""),
-                                "price": prev.get("price", ""),
-                                "terms": prev.get("terms", ""),
-                            })
-                        P["milestones"] = merged
-                st.session_state["params"] = P
-                st.session_state["draft_done"] = True
-                st.success("Drafted from the transcript. Review and edit every section "
-                           "below \u2014 then enter pricing in section 3 and Build.")
+                if mode == "New proposal":
+                    with st.spinner("Reading the call…"):
+                        extracted = llm_extract(client, model, transcript)
+                        for k, v in extracted.items():
+                            if v not in (None, ""):
+                                P[k] = v
+                        tt = P.get("target_type", "Protein")
+                        P["kd_method"] = KD_METHOD_BY_TYPE.get(tt, KD_METHOD_BY_TYPE["Other"])
+                        P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
+                    with st.spinner("Drafting in Base Pair voice…"):
+                        drafted = llm_draft(client, model, P)
+                        P["challenge_text"] = drafted.get("challenge_text", P["challenge_text"])
+                        P["strategy_text"] = drafted.get("strategy_text", P["strategy_text"])
+                        wb = drafted.get("workflow_bullets")
+                        if isinstance(wb, list) and wb:
+                            P["workflow_bullets"] = wb
+                        ph = drafted.get("phases")
+                        if isinstance(ph, list) and ph:
+                            P["milestones"] = merge_phases_keep_pricing(P.get("milestones", []), ph)
+                    st.session_state["params"] = P
+                    st.session_state["draft_done"] = True
+                    st.success("Drafted from the transcript. Review and edit every "
+                               "section below \u2014 then enter pricing in section 3 and Build.")
+                else:  # Revise existing
+                    with st.spinner("Applying feedback…"):
+                        rev = llm_revise(client, model, P, transcript, feedback)
+                        for k in ("subtitle", "phase_label", "challenge_text",
+                                  "strategy_text"):
+                            if rev.get(k):
+                                P[k] = rev[k]
+                        wb = rev.get("workflow_bullets")
+                        if isinstance(wb, list) and wb:
+                            P["workflow_bullets"] = wb
+                        ph = rev.get("phases")
+                        if isinstance(ph, list) and ph:
+                            P["milestones"] = merge_phases_keep_pricing(P.get("milestones", []), ph)
+                        P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
+                    st.session_state["params"] = P
+                    st.success("Revised per the feedback. Review the changes below "
+                               "(phases may have been restructured) \u2014 your prices "
+                               "were kept. Re-check pricing in section 3 before Build.")
             except Exception as e:
                 st.error(f"Generation failed: {e}")
 
