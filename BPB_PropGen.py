@@ -42,7 +42,7 @@ from pptx.oxml.ns import qn
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v17"
+APP_VERSION = "v18"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -903,6 +903,13 @@ def run_app():
             "4. Click **Build .pptx** in section 4 to download the deck. You can refine the "
             "deck further in PowerPoint afterward.\n\n"
             "Pricing is never set by the LLM \u2014 you always enter or approve it.")
+        st.markdown(
+            "**A note on \u201cRecent proposals\u201d (sidebar):** *Save current to history* keeps "
+            "a snapshot of the form so you can reload or branch from it \u2014 but only for "
+            "your current session. It is **not** a saved library: it clears when you close "
+            "the tab, when the session times out, or whenever the app is updated/redeployed, "
+            "and it is not shared between users. To keep a proposal, download the **.pptx** "
+            "(via Build) \u2014 that file is the permanent record.")
 
     # Pulse/glow animation to draw the eye to the two key action buttons until
     # each is used. We give each button a stable key; Streamlit renders that as
