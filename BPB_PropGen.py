@@ -47,7 +47,7 @@ from lxml import etree
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v21"
+APP_VERSION = "v22"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -1016,6 +1016,10 @@ def read_deck_into_params(pptx_bytes):
         if nonempty:
             params["subtitle"] = nonempty[0]
             params["phase_label"] = nonempty[1] if len(nonempty) > 1 else ""
+            # best-effort customer name from "Proposal to <customer> for a ..."
+            mo = _re.search(r"Proposal to (.+?) for an? ", nonempty[0])
+            if mo:
+                params["customer_short"] = mo.group(1).strip()
     date_sh = _shape_by_id(s1, ID_DATE)
     if date_sh is not None and date_sh.text_frame.text.strip():
         params["proposal_date"] = date_sh.text_frame.text.strip()
@@ -1483,6 +1487,7 @@ def run_app():
     if "history" not in st.session_state:
         st.session_state["history"] = []
     st.session_state.setdefault("ms_editor_nonce", 0)
+    st.session_state.setdefault("form_nonce", 0)
 
     def _bump_ms_editor():
         # Re-mount the milestone editor so it reloads from params (used whenever
@@ -1490,6 +1495,19 @@ def run_app():
         # deck load, draft/revise). Without this the editor keeps its old cells
         # and clobbers the new values on the next rerun.
         st.session_state["ms_editor_nonce"] = st.session_state.get("ms_editor_nonce", 0) + 1
+
+    def _k(field):
+        # Nonce-stamped widget key. Bumping form_nonce re-mounts the parameter
+        # widgets so they reload their values from params (needed when a deck is
+        # loaded or a draft/revision replaces the params; otherwise Streamlit
+        # keeps the widgets' old values and the sidebar/fields look unchanged).
+        return f"p{st.session_state['form_nonce']}_{field}"
+
+    def _reload_widgets():
+        # Force BOTH the parameter widgets and the milestone editor to reload
+        # from params. Call after any programmatic replacement of params.
+        st.session_state["form_nonce"] = st.session_state.get("form_nonce", 0) + 1
+        _bump_ms_editor()
 
     P = st.session_state["params"]
 
@@ -1540,7 +1558,7 @@ def run_app():
         for i, h in enumerate(st.session_state["history"]):
             if st.button(h["label"], key=f"hist_{i}"):
                 st.session_state["params"] = copy.deepcopy(h["params"])
-                _bump_ms_editor()
+                _reload_widgets()
                 st.rerun()
 
     # ====================================================================== #
@@ -1578,7 +1596,7 @@ def run_app():
                     st.session_state["base_deck_params"] = copy.deepcopy(base)
                     st.session_state["params"] = base
                     st.session_state["loaded_deck_sig"] = sig
-                    _bump_ms_editor()
+                    _reload_widgets()
                     P = st.session_state["params"]
                     rv = (_read_state_from_bytes(raw) or {}).get("_revision", 0)
                     st.success(f"Loaded the deck (revision {rv}). Its current text is now in "
@@ -1650,7 +1668,7 @@ def run_app():
                             P["milestones"] = merge_phases_keep_pricing(P.get("milestones", []), ph)
                     st.session_state["params"] = P
                     st.session_state["draft_done"] = True
-                    _bump_ms_editor()
+                    _reload_widgets()
                     st.success("Drafted from the transcript. Review and edit every "
                                "section below \u2014 then enter pricing in section 3 and Build.")
                 else:  # Revise existing
@@ -1671,7 +1689,7 @@ def run_app():
                         if not on_deck:
                             P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
                     st.session_state["params"] = P
-                    _bump_ms_editor()
+                    _reload_widgets()
                     msg = ("Revised per the feedback. Review the changes below "
                            "(phases may have been restructured) \u2014 your prices were kept.")
                     if on_deck:
@@ -1687,47 +1705,59 @@ def run_app():
     with st.sidebar:
         st.header("Parameters")
         with st.expander("Customer & contacts", expanded=True):
-            P["customer_short"] = st.text_input("Customer (short)", P["customer_short"])
-            P["customer_full"] = st.text_input("Customer (full)", P.get("customer_full", ""))
-            P["pi_contact"] = st.text_input("Lead contact / PI", P.get("pi_contact", ""))
+            P["customer_short"] = st.text_input("Customer (short)", P["customer_short"],
+                                                key=_k("customer_short"))
+            P["customer_full"] = st.text_input("Customer (full)", P.get("customer_full", ""),
+                                               key=_k("customer_full"))
+            P["pi_contact"] = st.text_input("Lead contact / PI", P.get("pi_contact", ""),
+                                            key=_k("pi_contact"))
             P["institution_type"] = st.selectbox(
                 "Institution type",
                 ["Academic", "Biotech", "Pharma", "Startup", "Government", "Other"],
                 index=max(0, ["Academic", "Biotech", "Pharma", "Startup",
                               "Government", "Other"].index(P.get("institution_type", "Academic"))
                           if P.get("institution_type") in
-                          ["Academic", "Biotech", "Pharma", "Startup", "Government", "Other"] else 0))
-            P["proposal_date"] = st.text_input("Proposal date", P["proposal_date"])
+                          ["Academic", "Biotech", "Pharma", "Startup", "Government", "Other"] else 0),
+                key=_k("institution_type"))
+            P["proposal_date"] = st.text_input("Proposal date", P["proposal_date"],
+                                               key=_k("proposal_date"))
 
         with st.expander("Target & strategy", expanded=True):
-            P["target"] = st.text_input("Target", P.get("target", ""))
+            P["target"] = st.text_input("Target", P.get("target", ""), key=_k("target"))
             prev_tt = P.get("target_type", "Protein")
             tt = st.selectbox("Target type", TARGET_TYPES,
                               index=TARGET_TYPES.index(prev_tt)
-                              if prev_tt in TARGET_TYPES else 0)
+                              if prev_tt in TARGET_TYPES else 0,
+                              key=_k("target_type"))
             # changing the target type re-suggests the affinity method
             if tt != prev_tt:
                 P["kd_method"] = KD_METHOD_BY_TYPE.get(tt, KD_METHOD_BLI)
             P["target_type"] = tt
             P["existing_aptamer"] = st.checkbox(
                 "Base Pair already holds a relevant aptamer",
-                value=bool(P.get("existing_aptamer", False)))
+                value=bool(P.get("existing_aptamer", False)),
+                key=_k("existing_aptamer"))
             P["existing_aptamer_desc"] = st.text_area(
-                "Existing aptamer (description)", P.get("existing_aptamer_desc", ""))
-            P["biological_matrix"] = st.text_input("Biological matrix", P.get("biological_matrix", ""))
+                "Existing aptamer (description)", P.get("existing_aptamer_desc", ""),
+                key=_k("existing_aptamer_desc"))
+            P["biological_matrix"] = st.text_input("Biological matrix", P.get("biological_matrix", ""),
+                                                   key=_k("biological_matrix"))
             P["off_targets"] = st.text_input("Off-targets to avoid (counter-selection)",
-                                             P.get("off_targets", ""))
-            P["assay_format_goal"] = st.text_input("Assay format goal", P.get("assay_format_goal", ""))
+                                             P.get("off_targets", ""), key=_k("off_targets"))
+            P["assay_format_goal"] = st.text_input("Assay format goal", P.get("assay_format_goal", ""),
+                                                   key=_k("assay_format_goal"))
             cur_kd = P.get("kd_method") or KD_METHOD_BY_TYPE.get(tt, KD_METHOD_BLI)
             kd_opts = KD_METHOD_OPTIONS if cur_kd in KD_METHOD_OPTIONS \
                 else KD_METHOD_OPTIONS + [cur_kd]
             P["kd_method"] = st.selectbox(
                 "Affinity ($K_D$) determination method", kd_opts,
                 index=kd_opts.index(cur_kd),
-                help="Auto-suggested from Target type; override here if needed.")
+                help="Auto-suggested from Target type; override here if needed.",
+                key=_k("kd_method"))
             P["phases_included"] = st.selectbox(
                 "Phases", ["Phase 1 only", "Phase 1 + Phase 2 (if needed)"],
-                index=1 if "Phase 2" in P.get("phases_included", "") else 0)
+                index=1 if "Phase 2" in P.get("phases_included", "") else 0,
+                key=_k("phases_included"))
 
     # ====================================================================== #
     # STEP 2 — Review & edit the drafted slides
@@ -1735,22 +1765,26 @@ def run_app():
     st.subheader("2) Review & edit the drafted slides")
     P["background_problem"] = st.text_area(
         "Background / problem \u2014 context the Challenge was drafted from (not placed on a slide verbatim)",
-        P.get("background_problem", ""), height=120)
+        P.get("background_problem", ""), height=120, key=_k("background_problem"))
 
     st.markdown("**Slide 1 \u2014 title page** (text placed verbatim; not LLM-drafted)")
-    P["subtitle"] = st.text_area("Subtitle line", P.get("subtitle", ""), height=70)
-    P["phase_label"] = st.text_input("Phase label (italic)", P.get("phase_label", ""))
+    P["subtitle"] = st.text_area("Subtitle line", P.get("subtitle", ""), height=70,
+                                 key=_k("subtitle"))
+    P["phase_label"] = st.text_input("Phase label (italic)", P.get("phase_label", ""),
+                                     key=_k("phase_label"))
 
     st.markdown("**Slide 5 \u2014 Challenge & Strategy**")
-    P["challenge_text"] = st.text_area("Challenge", P["challenge_text"], height=120)
-    P["strategy_text"] = st.text_area("Strategy", P["strategy_text"], height=160)
+    P["challenge_text"] = st.text_area("Challenge", P["challenge_text"], height=120,
+                                       key=_k("challenge_text"))
+    P["strategy_text"] = st.text_area("Strategy", P["strategy_text"], height=160,
+                                      key=_k("strategy_text"))
 
     st.markdown("**Slide 6 \u2014 Workflow steps** — one field per bullet, in order")
     try:
         import pandas as pd
         wdf = pd.DataFrame({"Workflow step": P["workflow_bullets"] or [""]})
         wedit = st.data_editor(wdf, num_rows="dynamic", use_container_width=True,
-                               key="workflow_editor",
+                               key=f"workflow_editor_{st.session_state['form_nonce']}",
                                column_config={"Workflow step": st.column_config.TextColumn(
                                    "Workflow step", width="large")})
         P["workflow_bullets"] = [str(x) for x in wedit["Workflow step"].tolist()
@@ -1764,13 +1798,15 @@ def run_app():
             cur = P["workflow_bullets"][i] if i < len(P["workflow_bullets"]) else ""
             new.append(st.text_input(f"Step {i+1}", value=cur, key=f"wfb_{i}"))
         P["workflow_bullets"] = [b for b in new if b.strip()]
-    P["workflow_footnote"] = st.text_input("Workflow footnote", P.get("workflow_footnote", ""))
+    P["workflow_footnote"] = st.text_input("Workflow footnote", P.get("workflow_footnote", ""),
+                                           key=_k("workflow_footnote"))
 
     # ====================================================================== #
     # STEP 3 — Timeline & milestones (manual)
     # ====================================================================== #
     st.subheader("3) Project phases, timeline & milestones (you enter pricing)")
-    P["timeline_title"] = st.text_input("Slide 7 title", P["timeline_title"])
+    P["timeline_title"] = st.text_input("Slide 7 title", P["timeline_title"],
+                                        key=_k("timeline_title"))
 
     st.markdown(
         "**Phases / payment milestones** — each row is one phase: it becomes both a "
@@ -1867,10 +1903,12 @@ def run_app():
         st.metric("Project total (auto)", format_money(subtotal))
     with tc2:
         add_star = st.checkbox("Append \u201c*\u201d (footnote ref)",
-                               value=P.get("total_asterisk", True))
+                               value=P.get("total_asterisk", True),
+                               key=_k("total_asterisk"))
         P["total_asterisk"] = add_star
     with tc3:
-        P["total_note"] = st.text_input("Slide 7 footnote", P.get("total_note", ""))
+        P["total_note"] = st.text_input("Slide 7 footnote", P.get("total_note", ""),
+                                        key=_k("total_note"))
     P["total_price"] = format_money(subtotal) + ("*" if add_star else "")
     if n_unparsed:
         st.caption(f"\u26a0\ufe0f {n_unparsed} price cell(s) couldn't be read as a "
