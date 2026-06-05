@@ -47,7 +47,7 @@ from lxml import etree
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v20"
+APP_VERSION = "v21"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -1482,6 +1482,15 @@ def run_app():
         st.session_state["params"] = default_params()
     if "history" not in st.session_state:
         st.session_state["history"] = []
+    st.session_state.setdefault("ms_editor_nonce", 0)
+
+    def _bump_ms_editor():
+        # Re-mount the milestone editor so it reloads from params (used whenever
+        # we set prices/milestones programmatically, e.g. Approximate prices,
+        # deck load, draft/revise). Without this the editor keeps its old cells
+        # and clobbers the new values on the next rerun.
+        st.session_state["ms_editor_nonce"] = st.session_state.get("ms_editor_nonce", 0) + 1
+
     P = st.session_state["params"]
 
     # ---- Anthropic client (key persisted on this machine) ----
@@ -1531,6 +1540,7 @@ def run_app():
         for i, h in enumerate(st.session_state["history"]):
             if st.button(h["label"], key=f"hist_{i}"):
                 st.session_state["params"] = copy.deepcopy(h["params"])
+                _bump_ms_editor()
                 st.rerun()
 
     # ====================================================================== #
@@ -1559,21 +1569,31 @@ def run_app():
             "Upload the edited proposal deck (.pptx) to revise", type=["pptx"],
             key="deck_up")
         if deck_up is not None:
-            try:
-                raw = deck_up.getvalue()
-                base = read_deck_into_params(raw)
-                st.session_state["base_deck_bytes"] = raw
-                st.session_state["base_deck_params"] = copy.deepcopy(base)
-                st.session_state["params"] = base
-                P = st.session_state["params"]
-                rv = (_read_state_from_bytes(raw) or {}).get("_revision", 0)
-                st.success(f"Loaded the deck (revision {rv}). Its current text is now in "
-                           f"the fields below. Paste the feedback, then "
-                           f"**Apply feedback & re-draft**.")
-            except Exception as e:
-                st.error(f"Couldn't read that deck: {e}")
-        elif st.session_state.get("base_deck_bytes"):
-            st.caption("A deck is loaded for revision. Upload a different one to replace it.")
+            sig = (deck_up.name, deck_up.size)
+            if st.session_state.get("loaded_deck_sig") != sig:
+                try:
+                    raw = deck_up.getvalue()
+                    base = read_deck_into_params(raw)
+                    st.session_state["base_deck_bytes"] = raw
+                    st.session_state["base_deck_params"] = copy.deepcopy(base)
+                    st.session_state["params"] = base
+                    st.session_state["loaded_deck_sig"] = sig
+                    _bump_ms_editor()
+                    P = st.session_state["params"]
+                    rv = (_read_state_from_bytes(raw) or {}).get("_revision", 0)
+                    st.success(f"Loaded the deck (revision {rv}). Its current text is now in "
+                               f"the fields below. Paste the feedback, then "
+                               f"**Apply feedback & re-draft** \u2014 or just tweak pricing and "
+                               f"Build.")
+                except Exception as e:
+                    st.error(f"Couldn't read that deck: {e}")
+            else:
+                st.caption("Deck loaded. Edits you make below are kept; re-upload a "
+                           "different file to start from another deck.")
+        else:
+            st.session_state["loaded_deck_sig"] = None
+            if st.session_state.get("base_deck_bytes"):
+                st.caption("A deck is loaded for revision. Upload a different one to replace it.")
         feedback = st.text_area(
             "Follow-up / feedback (paste the email thread, notes, or a follow-up call)",
             height=160)
@@ -1608,6 +1628,7 @@ def run_app():
                 if mode == "New proposal":
                     st.session_state["base_deck_bytes"] = None
                     st.session_state["base_deck_params"] = None
+                    st.session_state["loaded_deck_sig"] = None
                     with st.spinner("Reading the call…"):
                         extracted = llm_extract(client, model, transcript)
                         for k, v in extracted.items():
@@ -1629,6 +1650,7 @@ def run_app():
                             P["milestones"] = merge_phases_keep_pricing(P.get("milestones", []), ph)
                     st.session_state["params"] = P
                     st.session_state["draft_done"] = True
+                    _bump_ms_editor()
                     st.success("Drafted from the transcript. Review and edit every "
                                "section below \u2014 then enter pricing in section 3 and Build.")
                 else:  # Revise existing
@@ -1649,6 +1671,7 @@ def run_app():
                         if not on_deck:
                             P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
                     st.session_state["params"] = P
+                    _bump_ms_editor()
                     msg = ("Revised per the feedback. Review the changes below "
                            "(phases may have been restructured) \u2014 your prices were kept.")
                     if on_deck:
@@ -1764,6 +1787,7 @@ def run_app():
             df = pd.DataFrame([{c: "" for c in cols}])
         edited = st.data_editor(
             df, num_rows="dynamic", use_container_width=True,
+            key=f"ms_editor_{st.session_state['ms_editor_nonce']}",
             column_config={
                 "short_label": st.column_config.TextColumn(
                     "Phase (banner)", help="Short label for the timeline box; "
@@ -1833,6 +1857,7 @@ def run_app():
                 distribute_ballpark(P["milestones"], ballpark, method=method)
                 st.session_state["params"] = P
                 st.session_state["price_done"] = True
+                _bump_ms_editor()
                 st.rerun()
 
     # ---- auto-computed total ----
