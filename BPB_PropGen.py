@@ -31,18 +31,23 @@ import os
 import io
 import json
 import copy
+import gzip
+import base64
+import zipfile
 from datetime import datetime
 
 from pptx import Presentation
 from pptx.util import Pt, Inches, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
+from lxml import etree
 
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v19"
+APP_VERSION = "v20"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -64,6 +69,16 @@ TL_BANNER_RIGHT  = 9.328
 TL_BANNER_TOP    = 1.593
 TL_BOX_HEIGHT    = 0.816
 TL_BOX_GAP       = 0.219      # horizontal gap between boxes
+
+# Baked-in formatting defaults (the tweaks formerly applied by hand to every deck).
+SUBTITLE_WIDTH_EMU   = 5379139            # slide 1: widen subtitle box to ~5.88"
+TABLE_TOP_LIFT_EMU   = int(0.23 * 914400) # slide 7: raise the milestone table ~0.23"
+TABLE_COL_FRACTIONS  = (0.544, 0.190, 0.266)  # Milestone / Pricing / Payment Terms
+TABLE_HDR_ROW_IN     = 0.34               # header & TOTAL row height (inches)
+TABLE_ROW_MIN_IN     = 0.40               # minimum milestone row height (inches)
+TABLE_LINE_IN        = 0.19               # approx rendered height per wrapped line
+TABLE_ROW_PAD_IN     = 0.10               # vertical padding added to each milestone row
+TABLE_FOOT_GAP_EMU   = int(0.10 * 914400) # gap between table bottom and footnote
 
 # Shape IDs of the variable shapes, keyed by 0-based slide index.
 # (Boilerplate slides 2,3,4 -> indices 1,2,3 are intentionally absent.)
@@ -459,11 +474,14 @@ def _set_single_line(shape, text):
 def _write_title_slide(slide, p):
     sub = _shape_by_id(slide, ID_SUBTITLE)
     if sub is not None:
+        sub.width = Emu(SUBTITLE_WIDTH_EMU)        # baked-in wider subtitle box
         tf = sub.text_frame
         para = _clear_textframe(tf)
         _no_bullet(para)
         _add_run(para, p["subtitle"], size_pt=28, bold=False, font="Calibri", color=WHITE)
         if p.get("phase_label"):
+            blank = tf.add_paragraph()             # baked-in line return after title
+            _no_bullet(blank)
             para2 = tf.add_paragraph()
             _no_bullet(para2)
             _add_run(para2, p["phase_label"], size_pt=18, italic=True,
@@ -514,26 +532,59 @@ def _write_workflow(slide, p):
         _emit(para, foot, size_pt=11, italic=True, font="Calibri", color=DARK)
 
 
+def _est_lines(text, col_width_emu, size_pt):
+    """Estimate how many wrapped lines `text` needs in a column of the given
+    width. Uses an average Calibri glyph advance of ~0.48 em."""
+    col_in = int(col_width_emu) / 914400.0
+    char_in = 0.48 * (size_pt / 72.0)          # average glyph width
+    usable = max(col_in - 0.16, 0.5)           # subtract ~0.08" L/R cell insets
+    per_line = max(int(usable / char_in), 1)
+    n = len(str(text or ""))
+    return max((n + per_line - 1) // per_line, 1)
+
+
 def _rebuild_milestones_table(slide, p):
-    """Delete the template table and add a fresh one sized to the milestones."""
-    old = _shape_by_id(slide, ID_TABLE)
+    """Delete the template table and add a fresh one sized to the milestones.
+
+    Returns the table's bottom edge (Emu) so the caller can position the
+    footnote beneath it regardless of how tall the table grew."""
+    old = _shape_by_id(slide, ID_TABLE) or _find_table(slide)
     if old is None:
-        return
-    left, top, width = old.left, old.top, old.width
-    col_w = [c.width for c in old.table.columns]
+        return None
+    left, top0, width = old.left, old.top, old.width
+    top = Emu(int(top0) - TABLE_TOP_LIFT_EMU)        # baked-in: raise table ~0.23"
+    # baked-in rebalanced columns (wider Payment Terms), as fractions of width
+    col_w, acc = [], 0
+    for k, frac in enumerate(TABLE_COL_FRACTIONS):
+        w = int(width) - acc if k == len(TABLE_COL_FRACTIONS) - 1 else int(int(width) * frac)
+        acc += w
+        col_w.append(Emu(w))
     # remove the old table shape
     old._element.getparent().remove(old._element)
 
     milestones = p.get("milestones", [])
     rows = len(milestones) + 2          # header + milestones + TOTAL
     cols = 3
-    height = Emu(int(0.42 * 914400 * rows))
+
+    # baked-in: content-driven row heights (replaces flat 0.42"/row that cramped
+    # long descriptions). Header and TOTAL stay compact; milestone rows grow.
+    row_h = [TABLE_HDR_ROW_IN]                       # header
+    for m in milestones:
+        lines = max(_est_lines(m.get("name", ""), col_w[0], 12),
+                    _est_lines(m.get("terms", ""), col_w[2], 10))
+        row_h.append(max(TABLE_ROW_MIN_IN, lines * TABLE_LINE_IN + TABLE_ROW_PAD_IN))
+    row_h.append(TABLE_HDR_ROW_IN)                   # TOTAL
+
+    height = Inches(sum(row_h))
     gf = slide.shapes.add_table(rows, cols, left, top, width, height)
     table = gf.table
+    gf.name = "BPB_MILESTONE_TABLE"     # stable tag for re-read / revise
     table.first_row = False             # we style the header ourselves
     table.horz_banding = False
     for j, w in enumerate(col_w):
         table.columns[j].width = w
+    for i, h in enumerate(row_h):
+        table.rows[i].height = Inches(h)
 
     headers = ["Milestone", "Pricing (USD)", "Payment Terms"]
 
@@ -565,6 +616,7 @@ def _rebuild_milestones_table(slide, p):
     style_cell(table.cell(last, 1), p.get("total_price", ""), bold=True,
                fill=BP_GREEN_LIGHT, size=12, align=PP_ALIGN.CENTER)
     style_cell(table.cell(last, 2), "", fill=BP_GREEN_LIGHT)
+    return Emu(int(top) + int(height))   # table bottom edge, for footnote placement
 
 
 def _rebuild_timeline_boxes(slide, milestones):
@@ -572,11 +624,16 @@ def _rebuild_timeline_boxes(slide, milestones):
     (4-6), evenly spaced across the banner. Each box shows the phase's short
     label (top) and duration (bottom)."""
     from pptx.enum.shapes import MSO_SHAPE
-    # remove the template boxes
+    # remove existing banner boxes: template ids 31-34 AND any tagged/edited boxes
+    els = []
     for sid in ID_TL_STEPS:
         sh = _shape_by_id(slide, sid)
         if sh is not None:
-            sh._element.getparent().remove(sh._element)
+            els.append(sh._element)
+    for sh in _find_boxes(slide):
+        els.append(sh._element)
+    for el in {id(e): e for e in els}.values():
+        el.getparent().remove(el)
 
     n = len(milestones)
     if n == 0:
@@ -592,6 +649,7 @@ def _rebuild_timeline_boxes(slide, milestones):
             MSO_SHAPE.ROUNDED_RECTANGLE,
             Inches(left), Inches(TL_BANNER_TOP),
             Inches(box_w), Inches(TL_BOX_HEIGHT))
+        box.name = "BPB_TL_BOX"             # stable tag for re-read / revise
         box.fill.solid()
         box.fill.fore_color.rgb = TL_BOX_BLUE
         box.line.fill.background()
@@ -636,14 +694,19 @@ def _write_timeline_slide(slide, p):
         _no_bullet(para)
         _add_run(para, p["total_note"], size_pt=10, italic=True, font="Calibri",
                  color=DARK)
-    _rebuild_milestones_table(slide, p)
+    table_bottom = _rebuild_milestones_table(slide, p)
+    if foot is not None and table_bottom is not None:
+        foot.top = Emu(int(table_bottom) + TABLE_FOOT_GAP_EMU)  # follow table bottom
 
 
 # --------------------------------------------------------------------------- #
 # Public engine entry point
 # --------------------------------------------------------------------------- #
 def build_proposal_pptx(params, template_path=TEMPLATE_FILENAME):
-    """Return the populated proposal deck as bytes. Streamlit-free."""
+    """Return the populated proposal deck as bytes. Streamlit-free.
+
+    The full parameter set is embedded in the file's custom document properties
+    so the deck can later be re-uploaded and revised (see revise_proposal_pptx)."""
     prs = Presentation(template_path)
     slides = list(prs.slides)
     _write_title_slide(slides[SLIDE_TITLE], params)
@@ -652,7 +715,415 @@ def build_proposal_pptx(params, template_path=TEMPLATE_FILENAME):
     _write_timeline_slide(slides[SLIDE_TIMELINE], params)
     bio = io.BytesIO()
     prs.save(bio)
-    return bio.getvalue()
+    state = dict(params)
+    state.setdefault("_revision", 0)
+    return _embed_state_in_bytes(bio.getvalue(), state)
+
+
+# --------------------------------------------------------------------------- #
+# Revision engine: build the next version ONTO the user's edited deck so that
+# manual formatting and minor text edits are preserved across revisions.
+# --------------------------------------------------------------------------- #
+
+# ---- embedded state (custom document properties survive a PowerPoint round-trip)
+_CUSTOM_NS = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+_VT_NS = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+_STATE_PROP = "BPBState"
+_STATE_FMTID = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
+
+
+def _encode_state(params):
+    blob = json.dumps(params, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(gzip.compress(blob)).decode("ascii")
+
+
+def _decode_state(text):
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(text)).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _embed_state_in_bytes(pptx_bytes, params):
+    """Write params into docProps/custom.xml (property 'BPBState') and return new bytes."""
+    zin = zipfile.ZipFile(io.BytesIO(pptx_bytes), "r")
+    items = {n: zin.read(n) for n in zin.namelist()}
+    zin.close()
+
+    C = "{%s}" % _CUSTOM_NS
+    V = "{%s}" % _VT_NS
+    if "docProps/custom.xml" in items:
+        root = etree.fromstring(items["docProps/custom.xml"])
+        for pr in list(root.findall(C + "property")):
+            if pr.get("name") == _STATE_PROP:
+                root.remove(pr)
+        pids = [int(pr.get("pid", "1")) for pr in root.findall(C + "property")]
+        next_pid = (max(pids) if pids else 1) + 1
+    else:
+        root = etree.Element(C + "Properties", nsmap={None: _CUSTOM_NS, "vt": _VT_NS})
+        next_pid = 2
+    prop = etree.SubElement(root, C + "property",
+                            {"fmtid": _STATE_FMTID, "pid": str(next_pid), "name": _STATE_PROP})
+    etree.SubElement(prop, V + "lpwstr").text = _encode_state(params)
+    items["docProps/custom.xml"] = etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    ct = items.get("[Content_Types].xml", b"")
+    if b"docProps/custom.xml" not in ct:
+        ins = (b'<Override PartName="/docProps/custom.xml" ContentType='
+               b'"application/vnd.openxmlformats-officedocument.custom-properties+xml"/>')
+        items["[Content_Types].xml"] = ct.replace(b"</Types>", ins + b"</Types>")
+
+    rels = items.get("_rels/.rels", b"")
+    if b"custom-properties" not in rels:
+        rel = (b'<Relationship Id="rIdBPBState" Type='
+               b'"http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+               b'custom-properties" Target="docProps/custom.xml"/>')
+        items["_rels/.rels"] = rels.replace(b"</Relationships>", rel + b"</Relationships>")
+
+    out = io.BytesIO()
+    zo = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    for n, data in items.items():
+        zo.writestr(n, data)
+    zo.close()
+    return out.getvalue()
+
+
+def _read_state_from_bytes(pptx_bytes):
+    try:
+        zin = zipfile.ZipFile(io.BytesIO(pptx_bytes), "r")
+        if "docProps/custom.xml" not in zin.namelist():
+            zin.close(); return None
+        xml = zin.read("docProps/custom.xml"); zin.close()
+        root = etree.fromstring(xml)
+        C = "{%s}" % _CUSTOM_NS; V = "{%s}" % _VT_NS
+        for pr in root.findall(C + "property"):
+            if pr.get("name") == _STATE_PROP:
+                node = pr.find(V + "lpwstr")
+                if node is not None and node.text:
+                    return _decode_state(node.text)
+    except Exception:
+        return None
+    return None
+
+
+# ---- shape locators that work on edited decks (template ids no longer apply) ----
+def _find_table(slide):
+    for sh in slide.shapes:
+        if sh.has_table:
+            return sh
+    return None
+
+
+def _find_boxes(slide):
+    tagged = [sh for sh in slide.shapes if (sh.name or "") == "BPB_TL_BOX"]
+    if tagged:
+        return tagged
+    out = []
+    for sh in slide.shapes:
+        if sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+            try:
+                if sh.text_frame.text.strip():
+                    out.append(sh)
+            except Exception:
+                pass
+    return out
+
+
+# ---- formatting samplers / format-preserving writers ----
+def _sample_fmt(shape_or_cell):
+    """Read size/color/font/bold/italic from the first run of a shape or cell."""
+    out = dict(size_pt=14, color=DARK, font="Calibri", bold=False, italic=False)
+    try:
+        for p in shape_or_cell.text_frame.paragraphs:
+            if p.runs:
+                f = p.runs[0].font
+                if f.size is not None:
+                    out["size_pt"] = f.size.pt
+                out["font"] = f.name or "Calibri"
+                out["bold"] = bool(f.bold)
+                out["italic"] = bool(f.italic)
+                try:
+                    if f.color is not None and f.color.type is not None:
+                        out["color"] = f.color.rgb
+                except Exception:
+                    pass
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _set_text_preserve(shape, text):
+    if shape is None:
+        return
+    fmt = _sample_fmt(shape)
+    align = shape.text_frame.paragraphs[0].alignment
+    para = _clear_textframe(shape.text_frame)
+    _no_bullet(para)
+    if align is not None:
+        para.alignment = align
+    _emit(para, text, size_pt=fmt["size_pt"], bold=fmt["bold"], italic=fmt["italic"],
+          color=fmt["color"], font=fmt["font"])
+
+
+def _set_label_body_preserve(shape, label, body):
+    if shape is None:
+        return
+    fmt = _sample_fmt(shape)            # font size = whatever the user set (e.g. 13pt)
+    tf = shape.text_frame
+    tf.word_wrap = True
+    para = _clear_textframe(tf)
+    _no_bullet(para)
+    _add_run(para, f"{label}  ", size_pt=fmt["size_pt"], bold=True,
+             font=fmt["font"], color=fmt["color"])
+    _emit(para, body, size_pt=fmt["size_pt"], bold=False, font=fmt["font"], color=fmt["color"])
+
+
+def _rewrite_subtitle_preserve(shape, params):
+    if shape is None:
+        return
+    tf = shape.text_frame
+    sub_fmt = _sample_fmt(shape)
+    phase_size = 18
+    for p in tf.paragraphs:
+        for r in p.runs:
+            if r.font.italic:
+                if r.font.size is not None:
+                    phase_size = r.font.size.pt
+                break
+    para = _clear_textframe(tf)
+    _no_bullet(para)
+    _add_run(para, params.get("subtitle", ""), size_pt=sub_fmt["size_pt"],
+             color=sub_fmt["color"], font=sub_fmt["font"])
+    if params.get("phase_label"):
+        blank = tf.add_paragraph(); _no_bullet(blank)
+        p2 = tf.add_paragraph(); _no_bullet(p2)
+        _add_run(p2, params["phase_label"], size_pt=phase_size, italic=True,
+                 color=sub_fmt["color"], font=sub_fmt["font"])
+
+
+def _rewrite_workflow_preserve(shape, params):
+    if shape is None:
+        return
+    tf = shape.text_frame
+    tf.word_wrap = True
+    fmt = _sample_fmt(shape)
+    bullets = [b for b in params.get("workflow_bullets", []) if b.strip()]
+    foot = params.get("workflow_footnote", "").strip()
+    first = _clear_textframe(tf)
+    for i, b in enumerate(bullets):
+        para = first if i == 0 else tf.add_paragraph()
+        _set_number(para)
+        _emit(para, b, size_pt=fmt["size_pt"], font=fmt["font"], color=fmt["color"])
+    if foot:
+        para = tf.add_paragraph(); _no_bullet(para)
+        _emit(para, foot, size_pt=11, italic=True, font=fmt["font"], color=fmt["color"])
+
+
+def _cell_set_preserve(cell, text):
+    fmt = _sample_fmt(cell)
+    align = cell.text_frame.paragraphs[0].alignment
+    para = _clear_textframe(cell.text_frame)
+    if align is not None:
+        para.alignment = align
+    _emit(para, text, size_pt=fmt["size_pt"], bold=fmt["bold"],
+          color=fmt["color"], font=fmt["font"])
+
+
+def _update_table_inplace(table_gf, milestones, total_price):
+    table = table_gf.table
+    n = len(table.rows)
+    for i, m in enumerate(milestones, start=1):
+        if i >= n - 1:
+            break
+        pv = parse_price(m.get("price", ""))
+        price_disp = format_money(pv) if pv is not None else str(m.get("price", ""))
+        _cell_set_preserve(table.cell(i, 0), m.get("name", ""))
+        _cell_set_preserve(table.cell(i, 1), price_disp)
+        _cell_set_preserve(table.cell(i, 2), m.get("terms", ""))
+    _cell_set_preserve(table.cell(n - 1, 1), total_price)
+
+
+def _update_boxes_inplace(boxes, milestones):
+    for box, m in zip(boxes, milestones):
+        tf = box.text_frame
+        fmt = _sample_fmt(box)
+        label = m.get("short_label", "").strip() or _derive_short_label(m.get("name", ""))
+        first = _clear_textframe(tf)
+        first.alignment = PP_ALIGN.CENTER
+        _emit(first, label, size_pt=fmt["size_pt"], bold=True,
+              font=fmt["font"], color=fmt["color"])
+        w = parse_weeks(m.get("duration", ""))
+        if w:
+            p2 = tf.add_paragraph(); p2.alignment = PP_ALIGN.CENTER
+            _add_run(p2, fmt_weeks(*w), size_pt=max(7, fmt["size_pt"] - 1),
+                     font=fmt["font"], color=fmt["color"])
+
+
+# ---- read a (possibly hand-edited) deck back into a params dict ----
+def _strip_label(text, label):
+    t = (text or "").strip()
+    low = t.lower()
+    if low.startswith(label.lower() + ":"):
+        t = t[len(label) + 1:].strip()
+    elif low.startswith(label.lower()):
+        t = t[len(label):].lstrip(": ").strip()
+    return t
+
+
+def _read_table_milestones(table_gf, boxes):
+    table = table_gf.table
+    rows = list(table.rows)
+    milestones, total = [], ""
+    if len(rows) >= 2:
+        for i in range(1, len(rows) - 1):
+            milestones.append({
+                "name": table.cell(i, 0).text_frame.text.strip(),
+                "price": table.cell(i, 1).text_frame.text.strip(),
+                "terms": table.cell(i, 2).text_frame.text.strip(),
+                "short_label": "", "duration": "",
+            })
+        total = table.cell(len(rows) - 1, 1).text_frame.text.strip()
+    # short_label + duration from the banner boxes, matched by position
+    for idx, box in enumerate(boxes):
+        if idx >= len(milestones):
+            break
+        paras = [p.text.strip() for p in box.text_frame.paragraphs if p.text.strip()]
+        if paras:
+            milestones[idx]["short_label"] = paras[0]
+        if len(paras) > 1:
+            milestones[idx]["duration"] = normalize_weeks_cell(paras[1])
+    return milestones, total
+
+
+def read_deck_into_params(pptx_bytes):
+    """Reconstruct a params dict from a generated (and possibly hand-edited) deck.
+
+    Visible text is read from the shapes so manual edits are recovered; non-visible
+    fields (transcript, target, ballpark, etc.) come from the embedded state."""
+    params = copy.deepcopy(default_params())
+    state = _read_state_from_bytes(pptx_bytes)
+    if state:
+        params.update(state)
+    prs = Presentation(io.BytesIO(pptx_bytes))
+    slides = list(prs.slides)
+
+    s1 = slides[SLIDE_TITLE]
+    sub = _shape_by_id(s1, ID_SUBTITLE)
+    if sub is not None:
+        nonempty = [p.text.strip() for p in sub.text_frame.paragraphs if p.text.strip()]
+        if nonempty:
+            params["subtitle"] = nonempty[0]
+            params["phase_label"] = nonempty[1] if len(nonempty) > 1 else ""
+    date_sh = _shape_by_id(s1, ID_DATE)
+    if date_sh is not None and date_sh.text_frame.text.strip():
+        params["proposal_date"] = date_sh.text_frame.text.strip()
+
+    s5 = slides[SLIDE_CHALLENGE]
+    ch = _shape_by_id(s5, ID_CHALLENGE)
+    if ch is not None and ch.text_frame.text.strip():
+        params["challenge_text"] = _strip_label(ch.text_frame.text, "Challenge")
+    stg = _shape_by_id(s5, ID_STRATEGY)
+    if stg is not None and stg.text_frame.text.strip():
+        params["strategy_text"] = _strip_label(stg.text_frame.text, "Strategy")
+
+    wf = _shape_by_id(slides[SLIDE_WORKFLOW], ID_WORKFLOW)
+    if wf is not None:
+        bullets, foot = [], ""
+        for p in wf.text_frame.paragraphs:
+            t = p.text.strip()
+            if not t:
+                continue
+            if t.startswith("*"):
+                foot = t
+            else:
+                bullets.append(t)
+        if bullets:
+            params["workflow_bullets"] = bullets
+        params["workflow_footnote"] = foot
+
+    s7 = slides[SLIDE_TIMELINE]
+    tlt = _shape_by_id(s7, ID_TL_TITLE)
+    if tlt is not None and tlt.text_frame.text.strip():
+        params["timeline_title"] = tlt.text_frame.text.strip()
+    foot = _shape_by_id(s7, ID_TL_FOOT)
+    if foot is not None and foot.text_frame.text.strip():
+        params["total_note"] = foot.text_frame.text.strip()
+    table = _find_table(s7)
+    if table is not None:
+        ms, total = _read_table_milestones(table, _find_boxes(s7))
+        if ms:
+            params["milestones"] = ms
+        if total:
+            params["total_price"] = total
+    params["timeline_estimate"] = timeline_line(params.get("milestones", []))
+    return params
+
+
+def revise_proposal_pptx(params, base_pptx_bytes, prev_params=None):
+    """Build the next version ONTO the user's edited deck, preserving its formatting.
+
+    Only fields that differ from prev_params are rewritten (so untouched, manually
+    formatted shapes are left alone). The milestone table and banner boxes are
+    updated in place when the phase count is unchanged, and rebuilt with house
+    defaults only when phases were added or removed. Returns new deck bytes with
+    refreshed embedded state and an incremented revision counter."""
+    prs = Presentation(io.BytesIO(base_pptx_bytes))
+    slides = list(prs.slides)
+    prev = prev_params or {}
+
+    def changed(key):
+        return prev.get(key) != params.get(key)
+
+    s1 = slides[SLIDE_TITLE]
+    if changed("subtitle") or changed("phase_label"):
+        _rewrite_subtitle_preserve(_shape_by_id(s1, ID_SUBTITLE), params)
+    if changed("proposal_date"):
+        _set_text_preserve(_shape_by_id(s1, ID_DATE), params.get("proposal_date", ""))
+
+    s5 = slides[SLIDE_CHALLENGE]
+    if changed("challenge_text"):
+        _set_label_body_preserve(_shape_by_id(s5, ID_CHALLENGE), "Challenge:",
+                                 params.get("challenge_text", ""))
+    if changed("strategy_text"):
+        _set_label_body_preserve(_shape_by_id(s5, ID_STRATEGY), "Strategy:",
+                                 params.get("strategy_text", ""))
+
+    if changed("workflow_bullets") or changed("workflow_footnote"):
+        _rewrite_workflow_preserve(_shape_by_id(slides[SLIDE_WORKFLOW], ID_WORKFLOW), params)
+
+    s7 = slides[SLIDE_TIMELINE]
+    if changed("timeline_title"):
+        _set_text_preserve(_shape_by_id(s7, ID_TL_TITLE), params.get("timeline_title", ""))
+    # timeline line is derived from durations -> always refresh it
+    _set_text_preserve(_shape_by_id(s7, ID_TL_LINE), params.get("timeline_estimate", ""))
+    if changed("total_note"):
+        _set_text_preserve(_shape_by_id(s7, ID_TL_FOOT), params.get("total_note", ""))
+
+    new_ms = params.get("milestones", [])
+    table = _find_table(s7)
+    boxes = _find_boxes(s7)
+    cur_rows = (len(table.table.rows) - 2) if table is not None else -1
+    count_same = (table is not None and len(new_ms) == cur_rows and len(boxes) == len(new_ms))
+    if new_ms:
+        if count_same:
+            if changed("milestones") or changed("total_price"):
+                _update_table_inplace(table, new_ms, params.get("total_price", ""))
+            if changed("milestones"):
+                _update_boxes_inplace(boxes, new_ms)
+        else:
+            tb = _rebuild_milestones_table(s7, params)   # rebuild with house defaults
+            _rebuild_timeline_boxes(s7, new_ms)
+            ft = _shape_by_id(s7, ID_TL_FOOT)
+            if ft is not None and tb is not None:
+                ft.top = Emu(int(tb) + TABLE_FOOT_GAP_EMU)
+
+    state = dict(params)
+    state["_revision"] = int(prev.get("_revision", params.get("_revision", 0)) or 0) + 1
+    bio = io.BytesIO()
+    prs.save(bio)
+    return _embed_state_in_bytes(bio.getvalue(), state)
 
 
 # --------------------------------------------------------------------------- #
@@ -1079,6 +1550,30 @@ def run_app():
 
     feedback = ""
     if mode == "Revise existing":
+        st.markdown(
+            "**Revise from your edited deck.** Upload the **.pptx you downloaded and "
+            "tweaked in PowerPoint** \u2014 your manual formatting and text edits are kept, "
+            "and only what the feedback changes is rewritten. You can repeat this for "
+            "multiple rounds (each downloaded revision can be re-uploaded here).")
+        deck_up = st.file_uploader(
+            "Upload the edited proposal deck (.pptx) to revise", type=["pptx"],
+            key="deck_up")
+        if deck_up is not None:
+            try:
+                raw = deck_up.getvalue()
+                base = read_deck_into_params(raw)
+                st.session_state["base_deck_bytes"] = raw
+                st.session_state["base_deck_params"] = copy.deepcopy(base)
+                st.session_state["params"] = base
+                P = st.session_state["params"]
+                rv = (_read_state_from_bytes(raw) or {}).get("_revision", 0)
+                st.success(f"Loaded the deck (revision {rv}). Its current text is now in "
+                           f"the fields below. Paste the feedback, then "
+                           f"**Apply feedback & re-draft**.")
+            except Exception as e:
+                st.error(f"Couldn't read that deck: {e}")
+        elif st.session_state.get("base_deck_bytes"):
+            st.caption("A deck is loaded for revision. Upload a different one to replace it.")
         feedback = st.text_area(
             "Follow-up / feedback (paste the email thread, notes, or a follow-up call)",
             height=160)
@@ -1111,6 +1606,8 @@ def run_app():
         else:
             try:
                 if mode == "New proposal":
+                    st.session_state["base_deck_bytes"] = None
+                    st.session_state["base_deck_params"] = None
                     with st.spinner("Reading the call…"):
                         extracted = llm_extract(client, model, transcript)
                         for k, v in extracted.items():
@@ -1119,6 +1616,7 @@ def run_app():
                         tt = P.get("target_type", "Protein")
                         P["kd_method"] = KD_METHOD_BY_TYPE.get(tt, KD_METHOD_BY_TYPE["Other"])
                         P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
+                        P["_transcript"] = transcript
                     with st.spinner("Drafting in Base Pair voice…"):
                         drafted = llm_draft(client, model, P)
                         P["challenge_text"] = drafted.get("challenge_text", P["challenge_text"])
@@ -1134,8 +1632,10 @@ def run_app():
                     st.success("Drafted from the transcript. Review and edit every "
                                "section below \u2014 then enter pricing in section 3 and Build.")
                 else:  # Revise existing
+                    on_deck = bool(st.session_state.get("base_deck_bytes"))
+                    src_transcript = (P.get("_transcript") or transcript) if on_deck else transcript
                     with st.spinner("Applying feedback…"):
-                        rev = llm_revise(client, model, P, transcript, feedback)
+                        rev = llm_revise(client, model, P, src_transcript, feedback)
                         for k in ("subtitle", "phase_label", "challenge_text",
                                   "strategy_text"):
                             if rev.get(k):
@@ -1146,11 +1646,15 @@ def run_app():
                         ph = rev.get("phases")
                         if isinstance(ph, list) and ph:
                             P["milestones"] = merge_phases_keep_pricing(P.get("milestones", []), ph)
-                        P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
+                        if not on_deck:
+                            P["proposal_date"] = datetime.now().strftime("%B %d, %Y")
                     st.session_state["params"] = P
-                    st.success("Revised per the feedback. Review the changes below "
-                               "(phases may have been restructured) \u2014 your prices "
-                               "were kept. Re-check pricing in section 3 before Build.")
+                    msg = ("Revised per the feedback. Review the changes below "
+                           "(phases may have been restructured) \u2014 your prices were kept.")
+                    if on_deck:
+                        msg += (" When you Build, the changes are written **onto your "
+                                "uploaded deck**, so your manual formatting is preserved.")
+                    st.success(msg)
             except Exception as e:
                 st.error(f"Generation failed: {e}")
 
@@ -1352,19 +1856,37 @@ def run_app():
     # STEP 4 — Generate the deck
     # ====================================================================== #
     st.subheader("4) Generate proposal deck")
+    _on_deck = (mode == "Revise existing") and bool(st.session_state.get("base_deck_bytes"))
+    if _on_deck:
+        st.caption("Build mode: **revising your uploaded deck** \u2014 manual formatting is "
+                   "preserved; only changed content is rewritten. The result can be "
+                   "re-uploaded above for another round.")
     if st.button("Build .pptx", type="primary"):
-        if not os.path.exists(TEMPLATE_PATH):
-            st.error(f"Template '{TEMPLATE_FILENAME}' not found next to the app.")
-        else:
-            try:
+        try:
+            data = None
+            if _on_deck:
+                data = revise_proposal_pptx(
+                    P, st.session_state["base_deck_bytes"],
+                    prev_params=st.session_state.get("base_deck_params"))
+                # the freshly built revision becomes the base for the next round
+                st.session_state["base_deck_bytes"] = data
+                st.session_state["base_deck_params"] = copy.deepcopy(P)
+            elif not os.path.exists(TEMPLATE_PATH):
+                st.error(f"Template '{TEMPLATE_FILENAME}' not found next to the app.")
+            else:
                 data = build_proposal_pptx(P, TEMPLATE_PATH)
+            if data:
                 safe = "".join(c for c in P["customer_short"] if c.isalnum() or c in " _-").strip().replace(" ", "_")
-                fname = f"BasePair_Proposal_{safe}_{datetime.now().strftime('%Y%m%d_%H%M')}.pptx"
+                rev_tag = ""
+                if _on_deck:
+                    rv = (_read_state_from_bytes(data) or {}).get("_revision", 0)
+                    rev_tag = f"_rev{rv}"
+                fname = f"BasePair_Proposal_{safe}_{datetime.now().strftime('%Y%m%d_%H%M')}{rev_tag}.pptx"
                 st.download_button("Download proposal deck", data=data, file_name=fname,
                                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-                st.success("Deck built.")
-            except Exception as e:
-                st.error(f"Build failed: {e}")
+                st.success("Revision built onto your deck." if _on_deck else "Deck built.")
+        except Exception as e:
+            st.error(f"Build failed: {e}")
 
     st.session_state["params"] = P
     st.caption(f"{os.path.basename(__file__)} ({APP_VERSION}) "
