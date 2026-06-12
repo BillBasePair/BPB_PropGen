@@ -47,7 +47,7 @@ from lxml import etree
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-APP_VERSION = "v22"
+APP_VERSION = "v23"
 TEMPLATE_FILENAME = "proposal_template.pptx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(APP_DIR, TEMPLATE_FILENAME)
@@ -223,7 +223,7 @@ def timeline_line(milestones):
 
 
 def distribute_ballpark(milestones, total, method="duration", round_to=100,
-                        init_fraction=0.31):
+                        init_fraction=0.48):
     """Approximate each milestone price so they sum to `total`.
     The FIRST milestone (Project Initiation) is frontloaded at `init_fraction`
     of the total; the remainder is split across the other milestones, weighted
@@ -1443,7 +1443,7 @@ def run_app():
             "2. Review and edit everything in the sidebar and section 2 (all text is editable).\n"
             "3. In section 3, set phase durations (in weeks) and enter pricing \u2014 either "
             "type each milestone fee or enter a **Ballpark project total** and click "
-            "**Approximate prices** (Project Initiation is frontloaded at 31%; the rest is "
+            "**Approximate prices** (Project Initiation is frontloaded at 48%; the rest is "
             "distributed by phase duration). The timeline line is computed from the durations.\n"
             "4. Click **Build .pptx** in section 4 to download the deck. You can refine the "
             "deck further in PowerPoint afterward.\n\n"
@@ -1703,7 +1703,9 @@ def run_app():
     # Sidebar — parameter review/edit
     # ====================================================================== #
     with st.sidebar:
-        st.header("Parameters")
+        st.header("Draft inputs")
+        st.caption("Read by Claude when you Draft / Re-draft. Edits here reach the "
+                   "deck on the next (re-)draft \u2014 not at Build.")
         with st.expander("Customer & contacts", expanded=True):
             P["customer_short"] = st.text_input("Customer (short)", P["customer_short"],
                                                 key=_k("customer_short"))
@@ -1870,7 +1872,7 @@ def run_app():
     # ---- ballpark pricing ----
     st.markdown("**Ballpark pricing** — enter a target project total and approximate the "
                 "per-milestone fees. **Project Initiation (first row) is frontloaded at "
-                "31%**; the rest is split across the other milestones by the chosen "
+                "48%**; the rest is split across the other milestones by the chosen "
                 "method. Then fine-tune any row above.")
     bc1, bc2, bc3 = st.columns([1.2, 1.2, 1])
     with bc1:
